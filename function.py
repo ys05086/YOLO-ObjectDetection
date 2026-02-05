@@ -4,32 +4,10 @@ import cv2
 import numpy as np
 import torch
 import xml.etree.ElementTree as ET
+
 from tqdm import tqdm
 import sys
-
-class_colormap = {
-    "0":[0,0,0], #back ground
-    "1":[0,0,128], #aero plane
-    "2":[0,128,0], #Bicycle
-    "3":[0,128,128], # Bird
-    "4":[128,0,0], #Boat
-    "5":[128,0,128], #Bottle
-    "6":[128,128,0], #Bus
-    "7":[128,128,128], #Car
-    "8":[0,0,64], #Cat
-    "9":[0,0,192], #Chair
-    "10":[0,128,64], #Cow
-    "11":[0,128,192], #Dining Table
-    "12":[128,0,64], #Dog
-    "13":[128,0,192], #Horse
-    "14":[128,128,64], #Motorbike
-    "15":[128,128,192], #Person
-    "16":[0,64,0], #Potted Plant
-    "17":[0,64,128], #Sheep
-    "18":[0,192,0], #Sofa
-    "19":[0,192,128], #Train
-    "20":[128,64,0], #TV/Monitor
-}
+import torch.nn.functional as F
 
 # def data_augmentation
 
@@ -53,11 +31,6 @@ class LoadData: # and Data preprocessing
 
     def data_augmentation(self, img, gt):
         return img, gt
-
-    # def minibatch_training(self, batch_size):
-    #     np.random.seed(None)
-    #     img = read
-    #     return img, gt_tensor
 
     # [ name, size, x_mid, y_mid, x_len, y_len, class ]
     # list_ = anno_data[index]
@@ -153,15 +126,18 @@ class LoadData: # and Data preprocessing
         return list_
 
     def load_test_data(self, index: int, grid_size: int, size: int = 448, bbox_count: int = 2, classes: int = 20):
-        i = index
+        test_image = np.zeros((1, size, size, 3), dtype = np.float32)
         test_img, test_gt = self.return_img_gt(
-            i,
+            index = index,
             grid_size = grid_size,
             size = size,
             bbox_count = bbox_count,
-            classes = classes
-        )
-        return test_img, test_gt
+            classes = classes,
+            test = True
+        ) # test image shape = [S, S, 3]
+        test_image[0:1, :, :, :] = test_img
+        test_image = np.transpose(test_image, (0, 3, 1, 2)) / 255
+        return test_image, test_gt
 
     def set_data(self, size: int = 448):
         data = []
@@ -213,15 +189,6 @@ class LoadData: # and Data preprocessing
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) # BGR to RGB
         return image
 
-    # def read_batch_image(self, batch_size, size, seed = None):
-    #     np.random.seed(seed)
-    #     batch_images = np.zeros((batch_size, size, size, 3))
-    #     rand_num = np.random.randint(0, len(self.list_annotations), batch_size)
-    #     for it in range(len(rand_num)):
-    #         temp_img = self.read_image(it, size, self.anno_data[rand_num[it]][0])
-    #         batch_images[it, :, :, :] = temp_img
-    #     return batch_images, rand_num
-
     def check_path(self):
         # check end of path whether it contains '/' or not
         if self.annotation_path[-1] != '/':
@@ -265,51 +232,107 @@ class LossFunction(torch.nn.Module):
         self.classes = classes
         self.size = size
 
-    def check(self, i):
-        one_obj = i
-        return one_obj
-
-    def confidence(self, tensor):
-        confidence = 0.1
-        return confidence
-
-    def to_global_coordinate(self, tensor, size = 448):
-        return tensor
-
-    def mask(self, gt):
-        obj_mask = gt[:, :, :, 4]
-        noobj_mask = torch.where(obj_mask == 0, self.ln, 0)
-        return obj_mask + noobj_mask
-
-    def reverse_(self, value):
-        return 0
-
-    def tensor_iou(self, pred, gt):
+    def to_abs_coord(self, pred, gt):
         B, S = pred.shape[0], pred.shape[1]
 
-        g_e = torch.tensor([i for i in range(S)]) # grid element
-        grid_x, grid_y = torch.meshgrid(g_e, g_e, indexing='ij')
+        g_e = torch.arange(S, dtype = pred.dtype).to(pred.device)
+        grid_x, grid_y = torch.meshgrid(g_e, g_e, indexing = 'ij')
+
+        grid_x = grid_x.view(1, S, S, 1)
+        grid_y = grid_y.view(1, S, S, 1)
 
         pred = pred[:, :, :, : self.bbox * 5]
-        pred_boxes = torch.reshape(pred, (B, S, S, self.bbox, 5))
-        pred_bbox = pred_boxes[..., :4]
+        pred_boxes = torch.reshape(pred, (B, S, S, self.bbox, 5)) # [B, S, S, 2, 5]
+        pred_bbox = pred_boxes[..., :4] # [B, S, S, 2, 4]
         gt_bbox = gt[..., :4].unsqueeze(-2) # [B, S, S, 1, (x, y, w, h)]
-        obj_mask = gt[..., 4].unsqueeze(-1) # [B, S, S, 1]
-        
 
-        return tensor
+        # to abs coordinate
+        ix = (pred_bbox[..., 0] + grid_x) / S
+        iy = (pred_bbox[..., 1] + grid_y) / S
+        iw = pred_bbox[..., 2]
+        ih = pred_bbox[..., 3]
 
-    def pre(self, pred, gt):
+        gx = (gt_bbox[..., 0] + grid_x) / S
+        gy = (gt_bbox[..., 1] + grid_y) / S
+        gw = gt_bbox[..., 2]
+        gh = gt_bbox[..., 3]
 
-        return pred, gt, iou_tensor, one_tensor
+        ix1, iy1 = ix - iw / 2, iy - ih / 2
+        ix2, iy2 = ix + iw / 2, iy + ih / 2
 
-    def forward(self, pred, gt):
-        loss_1 = self.lc * ((gt[:, :, 0] - pred[:, :, 0])**2 + (gt[:, :, 1] - pred[:, :, 1])**2).sum(dim = 1)
-        loss_2 = self.lc * (((torch.sqrt(gt[:, :, 2]) - torch.sqrt(pred[:, :, 2]))**2).sum(dim = 1) + ((torch.sqrt(gt[:, :, 3]) - torch.sqrt(pred[:, :, 3]))**2)).sum(dim = 1)
-        loss_3 = ((self.confidence(gt) - self.confidence(pred))**2).sum()
-        loss_4 = self.ln * ((self.confidence(gt) - self.confidence(pred))**2).sum()
-        loss_5 = 1
-        loss = loss_1 + loss_2 + loss_3 + loss_4 + loss_5
+        gx1, gy1 = gx - gw / 2, gy - gh / 2
+        gx2, gy2 = gx + gw / 2, gy + gh / 2
+
+        list_ = [ix, iy, iw, ih, gx, gy, gw, gh]
+        list_decode = [ix1, iy1, ix2, iy2, gx1, gx2, gy1, gy2]
+
+        return list_, list_decode
+
+    def tensor_iou(self, list_decode, gt, eps = 1e-7):
+        obj_mask = gt[..., 4].unsqueeze(-1)  # [B, S, S, 1]
+
+        ix1, iy1, ix2, iy2, gx1, gx2, gy1, gy2 = list_decode
+
+        # intersection
+        inx1 = torch.maximum(ix1, gx1)
+        iny1 = torch.maximum(iy1, gy1)
+        inx2 = torch.minimum(ix2, gx2)
+        iny2 = torch.minimum(iy2, gy2)
+
+        inw = torch.clamp(inx2 - inx1, min = 0.0)
+        inh = torch.clamp(iny2 - iny1, min = 0.0)
+
+        inter = inw * inh
+
+        # union
+        area_p = torch.clamp(ix2 - ix1, min = 0.0) * torch.clamp(iy2 - iy1, min = 0.0)
+        area_g = torch.clamp(gx2 - gx1, min = 0.0) * torch.clamp(gy2 - gy1, min = 0.0)
+        union = area_p + area_g - inter
+
+        iou = inter / (union + eps) # to prevent division by 0, add eps to denom
+        # we only need object in
+        iou = iou * obj_mask
+
+        return iou
+
+    def forward(self, pred, gt, eps = 1e-7):
+        list_, list_decode = self.to_abs_coord(pred, gt)
+
+        ix, iy, iw, ih, gx, gy, gw, gh = list_ # [B, S, S, 2], [B, S, S]
+        iou_tensor = self.tensor_iou(list_decode, gt, eps) # [B, S, S, 2]
+
+        # make tensor size equal to: [B, S, S] -> [B, S, S, 2]
+        gx = gx.expand_as(ix)
+        gy = gy.expand_as(iy)
+        gw = gw.expand_as(iw)
+        gh = gh.expand_as(ih)
+
+        obj_cell = gt[..., 4].unsqueeze(-1).to(pred.dtype)
+        one_obj = iou_tensor.argmax(dim = -1)
+        resp = F.one_hot(one_obj, num_classes = self.bbox).to(pred.dtype).to(pred.device)
+
+        one_obj = obj_cell * resp
+        one_noobj = (1 - obj_cell).expand_as(one_obj)
+
+        # class prediction
+        pred_cls = pred[..., self.bbox * 5: self.bbox * 5 + self.classes] # [B, S, S, C]
+        gt_cls = gt[..., self.bbox * 5: self.bbox * 5 + self.classes]
+
+
+        loss_1 = self.lc * (
+                one_obj * (
+                (gx - ix)**2 + (gy - iy)**2 +
+                (torch.sqrt(gw) - torch.sqrt(torch.clamp(iw, min = 0.0)))**2 +
+                (torch.sqrt(gh) - torch.sqrt(torch.clamp(ih, min=0.0)))**2)
+        ).sum()
+
+        loss_2 = ((one_obj + self.ln * one_noobj) *
+                  ((torch.cat((pred[..., 4:5], pred[..., 9:10]), dim = -1) - iou_tensor.detach())**2)
+                  ).sum()
+
+        loss_3 = (obj_cell * ((pred_cls - gt_cls)**2)).sum()
+
+        loss = loss_1 + loss_2 + loss_3
         return loss
 
 # image visualisation and show bbox
